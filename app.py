@@ -1,255 +1,373 @@
-import streamlit as st
-import pandas as pd
+"""
+Streamlit app for Credit Card Fraud Detection
+Features:
+- Upload creditcard.csv or use default path
+- Full pipeline training (undersampling, SMOTE optional, anomaly detection, Random Forest)
+- Option to load a pretrained model (.pkl/.joblib)
+- Evaluation on full test set
+- Plots: class distribution, confusion matrix, ROC curve
+- Export trained model for later use
+- Simple prediction UI for single-row inputs
+
+Usage:
+    streamlit run streamlit_creditcard_fraud_app.py
+
+Dependencies:
+    pip install streamlit scikit-learn pandas matplotlib seaborn imbalanced-learn joblib
+    (imblearn optional but recommended)
+
+"""
+
+import io
+import os
+import time
+import joblib
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import streamlit as st
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier, IsolationForest
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-import random
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.svm import OneClassSVM
+from sklearn.metrics import (classification_report, accuracy_score, confusion_matrix,
+                             roc_auc_score, roc_curve, precision_recall_fscore_support)
 
-# --- Configuration ---
+# Optional imblearn
+try:
+    from imblearn.over_sampling import SMOTE
+    IMBLEARN_AVAILABLE = True
+except Exception:
+    IMBLEARN_AVAILABLE = False
+
+# Constants
 RANDOM_SEED = 42
 LABELS = ["Normal", "Fraud"]
+DEFAULT_FILEPATH = "creditcard.csv"
+MODEL_DIR = "models"
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-st.set_page_config(
-    page_title="Credit Card Fraud Detection",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Credit Card Fraud Detection", layout="wide")
 
-st.title("💳 Credit Card Fraud Detection Demo")
-st.markdown("Using Machine Learning (Random Forest & Isolation Forest) on an undersampled dataset.")
-st.divider()
-
-# --- Data Loading and Preprocessing (Cached for Performance) ---
+# --- Utility functions ---
+@st.cache_data(show_spinner=False)
+def load_csv(file) -> pd.DataFrame:
+    if isinstance(file, str):
+        df = pd.read_csv(file)
+    else:
+        # file is an UploadedFile
+        df = pd.read_csv(file)
+    return df
 
 @st.cache_data
-def load_and_preprocess_data(file_path):
-    """Loads the dataset, scales 'Amount', and drops 'Time'."""
-    try:
-        data = pd.read_csv(file_path, sep=',')
-    except FileNotFoundError:
-        st.error(f"Error: File not found at '{file_path}'. Please ensure 'creditcard.csv' is in the same directory.")
-        return None, None
-    
-    # Preprocessing
-    data['NormalizedAmount'] = StandardScaler().fit_transform(data['Amount'].values.reshape(-1, 1))
-    data = data.drop(['Time','Amount'],axis=1)
-    
-    # Separate features (X) and target (y)
-    X = data.iloc[:, data.columns != 'Class']
-    y = data.iloc[:, data.columns == 'Class']
+def preprocess(df: pd.DataFrame, scaler=None):
+    df = df.copy()
+    # Drop NaNs
+    df.dropna(inplace=True)
+    # Create NormalizedAmount
+    if scaler is None:
+        scaler = StandardScaler()
+        df['NormalizedAmount'] = scaler.fit_transform(df['Amount'].values.reshape(-1, 1))
+    else:
+        df['NormalizedAmount'] = scaler.transform(df['Amount'].values.reshape(-1, 1))
+    # Drop Time and Amount
+    if 'Time' in df.columns:
+        df = df.drop(['Time', 'Amount'], axis=1)
+    else:
+        df = df.drop(['Amount'], axis=1)
+    return df, scaler
 
-    return X, y, data
-
-@st.cache_resource
-def train_models(X, y):
-    """Performs undersampling, splits data, and trains models."""
-    
-    # 1. Undersampling
-    number_records_fraud = len(y[y['Class'] == 1])
-    fraud_indices = y[y['Class'] == 1].index
-    normal_indices = y[y['Class'] == 0].index
-    
-    random_normal_indices = np.random.choice(normal_indices, number_records_fraud, replace=False)
+@st.cache_data
+def undersample(X, y, random_state=RANDOM_SEED):
+    # return undersampled X,y balanced by minority class
+    fraud_count = y.sum()
+    fraud_indices = y[y == 1].index
+    normal_indices = y[y == 0].index
+    random_normal_indices = np.random.choice(normal_indices, int(fraud_count), replace=False)
     undersample_indices = np.concatenate([fraud_indices, random_normal_indices])
-    
-    undersample_data = X.loc[undersample_indices]
-    undersample_data['Class'] = y.loc[undersample_indices]
-    
-    X_undersample = undersample_data.drop('Class', axis=1)
-    y_undersample = undersample_data['Class']
+    return X.loc[undersample_indices].reset_index(drop=True), y.loc[undersample_indices].reset_index(drop=True)
 
-    # 2. Splitting (using original data for test set evaluation)
-    X_train_u, X_test_u, y_train_u, y_test_u = train_test_split(
-        X_undersample, y_undersample, test_size=0.3, random_state=RANDOM_SEED
-    )
-    
-    # Split the original full dataset for the test set (as used in the notebook)
-    _, X_test, _, y_test = train_test_split(X, y, test_size=0.3, random_state=RANDOM_SEED)
+@st.cache_data
+def split_full(X, y, test_size=0.3, random_state=RANDOM_SEED):
+    return train_test_split(X, y, test_size=test_size, random_state=random_state, stratify=y)
 
-    # 3. Model Training
-    
-    # Random Forest (Supervised)
-    st.info("Training Random Forest Classifier...")
-    clf_rf = RandomForestClassifier(n_estimators=100, random_state=RANDOM_SEED)
-    clf_rf.fit(X_train_u, y_train_u.values.ravel())
-    
-    # Isolation Forest (Unsupervised)
-    st.info("Training Isolation Forest...")
-    # Contamination is the percentage of outliers in the data, approximately 0.172%
-    clf_if = IsolationForest(
-        n_estimators=100, 
-        max_samples=len(X_train_u), 
-        contamination=0.00172, 
-        random_state=RANDOM_SEED, 
-        n_jobs=-1
-    )
-    clf_if.fit(X_train_u)
+@st.cache_data
+def train_random_forest(X_train, y_train, n_estimators=100, random_state=RANDOM_SEED):
+    clf = RandomForestClassifier(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
+    clf.fit(X_train, y_train)
+    return clf
 
-    return clf_rf, clf_if, X_test_u, y_test_u, X_test, y_test
+# Anomaly detectors
+def train_anomaly_models(X_train, contamination=None):
+    models = {}
+    # If contamination not specified, heuristically use  fraction of frauds in training
+    if contamination is None:
+        contamination = 0.01
 
-# --- Main Application Logic ---
+    models['IsolationForest'] = IsolationForest(n_estimators=100, max_samples='auto', contamination=contamination,
+                                                random_state=RANDOM_SEED, n_jobs=-1)
+    models['LocalOutlierFactor'] = LocalOutlierFactor(n_neighbors=20, contamination=contamination, novelty=True)
+    models['OneClassSVM'] = OneClassSVM(kernel='rbf', gamma='scale', nu=contamination)
 
-X, y, data_raw = load_and_preprocess_data('creditcard.csv')
+    for name, m in models.items():
+        # LOF must use fit for novelty=True
+        m.fit(X_train)
+    return models
 
-if X is None:
+# Metrics and plotting
+
+def plot_confusion_matrix(y_true, y_pred, ax=None):
+    cm = confusion_matrix(y_true, y_pred)
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5, 4))
+    else:
+        fig = None
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=LABELS, yticklabels=LABELS, ax=ax)
+    if fig:
+        st.pyplot(fig)
+    else:
+        return ax
+
+
+def prediction_metrics(y_true, y_pred):
+    acc = accuracy_score(y_true, y_pred)
+    try:
+        roc = roc_auc_score(y_true, y_pred)
+    except Exception:
+        roc = None
+    rep = classification_report(y_true, y_pred, target_names=LABELS, output_dict=True)
+    return acc, roc, rep
+
+# --- Streamlit UI ---
+st.title("🕵️ Credit Card Fraud Detection — Streamlit App")
+
+# Sidebar: Options
+st.sidebar.header("App Configuration")
+app_mode = st.sidebar.selectbox("Choose mode", ["Train & Evaluate", "Predict (Single)", "Load Pretrained Model", "README"]) 
+
+uploaded_file = st.sidebar.file_uploader("Upload creditcard.csv (optional)", type=['csv'])
+use_default = st.sidebar.checkbox("Use default creditcard.csv in working dir (if exists)", value=True)
+
+if uploaded_file is None and use_default and os.path.exists(DEFAULT_FILEPATH):
+    df = load_csv(DEFAULT_FILEPATH)
+elif uploaded_file is not None:
+    df = load_csv(uploaded_file)
+else:
+    df = None
+
+# Global placeholders
+trained_model = None
+scaler_obj = None
+
+# README Tab
+if app_mode == "README":
+    st.header("README — Credit Card Fraud Detection Streamlit App")
+    st.markdown("""
+    **Features:**
+    - Upload dataset or use default `creditcard.csv`.
+    - Full training pipeline with options: undersampling, SMOTE, class weights.
+    - Train anomaly detection models (IsolationForest, LOF, OneClassSVM) on *normal* data.
+    - Train RandomForest classifier on balanced/SMOTE/undersampled data.
+    - Evaluate on full held-out test set and visualize results.
+    - Save/Load trained models for fast predictions.
+
+    **How to use:**
+    1. Choose `Train & Evaluate` to run pipeline and train models.
+    2. Optionally download the trained RandomForest model to use later.
+    3. Choose `Predict (Single)` to input a single transaction and get a prediction.
+    4. Choose `Load Pretrained Model` to upload a `.pkl`/`.joblib` model.
+
+    **Notes:**
+    - `imblearn` (SMOTE) is optional but recommended to improve supervised performance.
+    - Anomaly detectors should be trained on normal examples only — this app does that by default.
+    """)
     st.stop()
 
-# Train models and get test sets
-clf_rf, clf_if, X_test_u, y_test_u, X_test, y_test = train_models(X, y)
+# TRAIN & EVALUATE
+if app_mode == "Train & Evaluate":
+    st.header("Train & Evaluate Pipeline")
+    if df is None:
+        st.warning("No dataset found. Upload a creditcard.csv in the sidebar or enable default file.")
+        st.stop()
 
-# --- Sidebar for Navigation ---
-st.sidebar.header("Navigation")
-page = st.sidebar.radio("Go to", ["Data Overview", "Model Performance", "Transaction Prediction Demo"])
+    st.subheader("Preview Data")
+    st.dataframe(df.head())
 
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Training Options")
+    test_size = st.sidebar.slider("Test Set Size (%)", 10, 50, 30)
+    apply_undersample = st.sidebar.checkbox("Use Undersampling (balanced by minority)", value=True)
+    apply_smote = st.sidebar.checkbox("Use SMOTE (if imblearn available)", value=False)
+    smote_ratio = st.sidebar.slider("SMOTE sampling ratio (when enabled)", 0.1, 1.0, 1.0)
+    use_class_weight = st.sidebar.checkbox("Use class_weight='balanced' for RF", value=True)
+    n_estimators = st.sidebar.number_input("RandomForest n_estimators", min_value=10, max_value=1000, value=100)
 
-# --- Data Overview Section ---
-if page == "Data Overview":
-    st.header("1. Data Overview")
-    st.subheader("Raw Data Sample (Pre-processing)")
-    st.dataframe(pd.read_csv('creditcard.csv', sep=',').head())
+    if apply_smote and not IMBLEARN_AVAILABLE:
+        st.sidebar.error("imblearn not available. Install: pip install imbalanced-learn")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Data Shape and Info")
-        st.write(f"**Total Records:** {data_raw.shape[0]:,}")
-        st.write(f"**Total Features:** {data_raw.shape[1]}")
-        st.markdown("**Note:** Features V1-V28 are PCA components. 'NormalizedAmount' is the scaled transaction amount.")
+    # Preprocess
+    with st.spinner("Preprocessing data..."):
+        df_proc, scaler_obj = preprocess(df)
+        X = df_proc.drop('Class', axis=1)
+        y = df_proc['Class']
 
-    with col2:
-        st.subheader("Class Distribution (Imbalance)")
-        
-        # Plotting Class Distribution
-        count_classes = data_raw['Class'].value_counts()
-        fig, ax = plt.subplots(figsize=(6, 4))
-        sns.barplot(x=count_classes.index, y=count_classes.values, ax=ax, palette=['#4CAF50', '#FF4B4B'])
-        ax.set_title("Transaction Class Distribution", fontsize=16)
-        ax.set_xticks(range(2))
-        ax.set_xticklabels(LABELS)
-        ax.set_xlabel("Class")
-        ax.set_ylabel("Frequency (log scale)")
-        ax.set_yscale('log')
+    st.markdown(f"**Dataset size:** {df_proc.shape[0]} rows — Fraud cases: {int(y.sum())}")
+
+    # Split full dataset
+    X_train_full, X_test_full, y_train_full, y_test_full = split_full(X, y, test_size=test_size/100)
+
+    # Prepare data for anomaly detection (train only on normal samples)
+    X_train_norm = X_train_full[y_train_full == 0]
+    st.markdown(f"Training anomaly detectors on normal-only data: {X_train_norm.shape[0]} rows")
+
+    # Train Anomaly models
+    contamination_est = max(0.001, y_train_full.mean())
+    with st.spinner("Training anomaly detection models..."):
+        anom_models = train_anomaly_models(X_train_norm, contamination=contamination_est)
+
+    st.success("Anomaly detectors trained.")
+
+    # Evaluate anomaly detectors on test subset - convert predictions
+    st.subheader("Anomaly Detection Evaluation (on holdout from undersampled balanced set)")
+    # For evaluation of anomaly detectors, we create an evaluation set from the test split (keeping original imbalance)
+    X_eval = X_test_full
+    y_eval = y_test_full
+
+    for name, model in anom_models.items():
+        st.markdown(f"**{name}**")
+        y_pred_raw = model.predict(X_eval)
+        # LOF and others: predict -> 1 inlier, -1 outlier
+        y_pred = np.where(y_pred_raw == 1, 0, 1)
+        acc, roc, rep = prediction_metrics(y_eval, y_pred)
+        st.write(f"Accuracy: {acc:.4f}")
+        st.write(f"ROC AUC (approx): {roc}")
+        st.json(rep)
+        fig, ax = plt.subplots()
+        plot_confusion_matrix(y_eval, y_pred, ax=ax)
         st.pyplot(fig)
-        
-        fraud_percent = (count_classes[1] / count_classes.sum()) * 100
-        st.markdown(f"**Fraudulent transactions: {count_classes[1]:,} ({fraud_percent:.3f}%)**")
 
+    # Prepare supervised training data
+    st.subheader("Supervised Training — Random Forest")
+    # Option: undersample or SMOTE or class-weight
+    if apply_undersample:
+        X_train_sup, y_train_sup = undersample(X_train_full, y_train_full)
+        st.write(f"Undersampled training size: {X_train_sup.shape[0]}")
+    else:
+        X_train_sup, y_train_sup = X_train_full.copy(), y_train_full.copy()
 
-# --- Model Performance Section ---
-elif page == "Model Performance":
-    st.header("2. Model Performance")
-    st.markdown("Performance metrics for the **Random Forest** classifier, trained on the **undersampled** data but tested on the **full, original test set**.")
+    if apply_smote and IMBLEARN_AVAILABLE:
+        st.write("Applying SMOTE to training data...")
+        sm = SMOTE(sampling_strategy=smote_ratio, random_state=RANDOM_SEED)
+        X_train_sup, y_train_sup = sm.fit_resample(X_train_sup, y_train_sup)
+        st.write(f"After SMOTE: {X_train_sup.shape[0]} rows — Fraud count: {int(y_train_sup.sum())}")
 
-    # 1. Random Forest Prediction and Evaluation
-    y_pred_rf = clf_rf.predict(X_test)
-    
-    st.subheader("Random Forest Classifier Results")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric(label="Accuracy Score (Full Test Set)", value=f"{accuracy_score(y_test.values.ravel(), y_pred_rf):.4f}")
-        st.text("Classification Report:")
-        st.code(classification_report(y_test.values.ravel(), y_pred_rf, target_names=LABELS))
-        
-    with col2:
-        st.text("Confusion Matrix:")
-        cm = confusion_matrix(y_test.values.ravel(), y_pred_rf)
-        fig_cm, ax_cm = plt.subplots(figsize=(6, 4))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False, 
-                    xticklabels=LABELS, yticklabels=LABELS, ax=ax_cm)
-        ax_cm.set_xlabel('Predicted Label')
-        ax_cm.set_ylabel('True Label')
-        ax_cm.set_title('Random Forest Confusion Matrix')
-        st.pyplot(fig_cm)
-        
-    st.caption("Note: The Random Forest model shows high accuracy but the metrics for the minority class (Fraud) are more important for real-world application.")
-    
-    st.subheader("Isolation Forest Results (on Undersampled Test Set)")
-    
-    # 2. Isolation Forest Prediction and Evaluation (Requires transformation of labels)
-    y_pred_if_raw = clf_if.predict(X_test_u)
-    y_pred_if = np.array(y_pred_if_raw)
-    y_pred_if[y_pred_if == 1] = 0   # 1 (inlier) -> 0 (Normal)
-    y_pred_if[y_pred_if == -1] = 1  # -1 (outlier) -> 1 (Fraud)
+    # Train RandomForest
+    rf_params = {"n_estimators": int(n_estimators), "random_state": RANDOM_SEED, "n_jobs": -1}
+    if use_class_weight:
+        rf_params['class_weight'] = 'balanced'
+    with st.spinner("Training Random Forest..."):
+        clf_rf = RandomForestClassifier(**rf_params)
+        clf_rf.fit(X_train_sup, y_train_sup)
+    st.success("Random Forest trained.")
 
-    col3, col4 = st.columns(2)
-    with col3:
-        st.metric(label="Accuracy Score (Undersampled Test Set)", value=f"{accuracy_score(y_test_u, y_pred_if):.4f}")
-        st.text("Classification Report:")
-        st.code(classification_report(y_test_u, y_pred_if, target_names=LABELS))
-    
-    with col4:
-        st.text("Confusion Matrix:")
-        cm_if = confusion_matrix(y_test_u, y_pred_if)
-        fig_cm_if, ax_cm_if = plt.subplots(figsize=(6, 4))
-        sns.heatmap(cm_if, annot=True, fmt='d', cmap='Blues', cbar=False, 
-                    xticklabels=LABELS, yticklabels=LABELS, ax=ax_cm_if)
-        ax_cm_if.set_xlabel('Predicted Label')
-        ax_cm_if.set_ylabel('True Label')
-        ax_cm_if.set_title('Isolation Forest Confusion Matrix')
-        st.pyplot(fig_cm_if)
-    
+    # Evaluate on full test set
+    y_pred_rf = clf_rf.predict(X_test_full)
+    acc_rf, roc_rf, rep_rf = prediction_metrics(y_test_full, y_pred_rf)
 
-# --- Transaction Prediction Demo Section ---
-elif page == "Transaction Prediction Demo":
-    st.header("3. Transaction Prediction Demo")
-    st.markdown("Use a sample transaction from the test set to see how the **Random Forest** model classifies it.")
-    
-    X_test_reset = X_test.reset_index(drop=True)
-    y_test_reset = y_test.reset_index(drop=True)
-    
-    # Find indices for demonstration
-    normal_indices = y_test_reset[y_test_reset['Class'] == 0].index.tolist()
-    fraud_indices = y_test_reset[y_test_reset['Class'] == 1].index.tolist()
+    st.write(f"**Random Forest — Test accuracy:** {acc_rf:.4f}")
+    if roc_rf is not None:
+        st.write(f"**ROC AUC (approx):** {roc_rf:.4f}")
 
-    # Create a selection list
-    selection_options = {
-        "Random Normal Transaction": random.choice(normal_indices),
-        "Random Fraudulent Transaction": random.choice(fraud_indices),
-    }
+    st.json(rep_rf)
+    fig, ax = plt.subplots()
+    plot_confusion_matrix(y_test_full, y_pred_rf, ax=ax)
+    st.pyplot(fig)
 
-    st.subheader("Select a Transaction Sample")
-    sample_type = st.selectbox("Choose a sample type:", list(selection_options.keys()))
-    
-    # Get the selected index
-    selected_idx = selection_options[sample_type]
+    # Feature importances
+    st.subheader("Feature Importances")
+    importances = pd.Series(clf_rf.feature_importances_, index=X.columns).sort_values(ascending=False)
+    st.bar_chart(importances.rename('importance'))
 
-    # Get the feature values for the selected sample
-    sample_features = X_test_reset.iloc[selected_idx].values.reshape(1, -1)
-    true_label = y_test_reset.iloc[selected_idx]['Class']
-    
-    st.markdown(f"---")
-    
-    col_input, col_output = st.columns([1, 1])
+    # Allow saving model
+    model_fname = st.text_input("Filename to save model (without extension)", value=f"rf_model_{int(time.time())}")
+    if st.button("Save Model"):
+        save_path = os.path.join(MODEL_DIR, model_fname + '.joblib')
+        joblib.dump({'model': clf_rf, 'scaler': scaler_obj}, save_path)
+        st.success(f"Model saved to {save_path}")
+        st.markdown(f"Download link (from server): `{save_path}` — or copy the file from server filesystem.")
 
-    with col_input:
-        st.subheader("Selected Transaction Features")
-        st.dataframe(pd.DataFrame(sample_features, columns=X_test.columns).T.rename(columns={0: "Value"}))
-        st.warning(f"**True Label:** **{LABELS[true_label]}**")
+    # Make trained model available in session state for prediction tab
+    st.session_state['trained_model'] = {'model': clf_rf, 'scaler': scaler_obj}
 
-    with col_output:
-        st.subheader("Model Prediction")
-        
-        # Make prediction
-        prediction_rf = clf_rf.predict(sample_features)[0]
-        prediction_label = LABELS[prediction_rf]
-        
-        if prediction_rf == 1:
-            st.error(f"Prediction: **{prediction_label}**")
-        else:
-            st.success(f"Prediction: **{prediction_label}**")
-            
-        # Display probability (for Random Forest)
-        proba = clf_rf.predict_proba(sample_features)[0]
-        st.markdown(f"**Probability of Normal:** `{proba[0]:.4f}`")
-        st.markdown(f"**Probability of Fraud:** `{proba[1]:.4f}`")
-        
-        # Check if the prediction was correct
-        if prediction_rf == true_label:
-            st.success("✅ Prediction is correct.")
-        else:
-            st.error("❌ Prediction is incorrect (Misclassification).")
+# LOAD PRETRAINED MODEL
+elif app_mode == "Load Pretrained Model":
+    st.header("Load Pretrained Model")
+    uploaded_model = st.file_uploader("Upload a .joblib or .pkl trained model", type=['joblib', 'pkl'])
+    if uploaded_model is not None:
+        try:
+            m = joblib.load(uploaded_model)
+            st.success("Model loaded successfully.")
+            st.write("Model keys:", list(m.keys()) if isinstance(m, dict) else str(type(m)))
+            st.session_state['trained_model'] = m
+        except Exception as e:
+            st.error(f"Failed to load model: {e}")
+    else:
+        st.info("Upload a model file to use for predictions.")
 
+# PREDICT SINGLE
+elif app_mode == "Predict (Single)":
+    st.header("Single Transaction Prediction")
+    if 'trained_model' not in st.session_state:
+        st.warning("No trained model found in session. You can train one in 'Train & Evaluate' or upload in 'Load Pretrained Model'.")
+        st.stop()
+
+    model_bundle = st.session_state['trained_model']
+    # model_bundle can be either {'model': clf, 'scaler': scaler} or clf object
+    if isinstance(model_bundle, dict) and 'model' in model_bundle:
+        clf = model_bundle['model']
+        scaler = model_bundle.get('scaler', None)
+    else:
+        clf = model_bundle
+        scaler = None
+
+    # Build input form from expected columns
+    # We assume original dataset columns V1..V28 + NormalizedAmount
+    sample_cols = clf.feature_names_in_ if hasattr(clf, 'feature_names_in_') else None
+    if sample_cols is None:
+        # Fallback: try common columns
+        sample_cols = [c for c in ['V' + str(i) for i in range(1, 29)] + ['NormalizedAmount'] if True]
+
+    st.write("Enter feature values for a single transaction. Leave blank to use sample (mean) values.")
+    user_input = {}
+    df_for_defaults = load_csv(DEFAULT_FILEPATH) if os.path.exists(DEFAULT_FILEPATH) else None
+    if df_for_defaults is not None:
+        df_defaults, _ = preprocess(df_for_defaults)
+    else:
+        df_defaults = None
+
+    cols_to_show = sample_cols
+    for col in cols_to_show:
+        default_val = None
+        if df_defaults is not None and col in df_defaults.columns:
+            default_val = float(df_defaults[col].mean())
+        user_input[col] = st.number_input(col, value=default_val if default_val is not None else 0.0)
+
+    if st.button("Predict"):
+        X_single = pd.DataFrame([user_input])
+        # Ensure columns align
+        X_single = X_single.reindex(columns=clf.feature_names_in_) if hasattr(clf, 'feature_names_in_') else X_single
+        pred = clf.predict(X_single)[0]
+        proba = clf.predict_proba(X_single)[0] if hasattr(clf, 'predict_proba') else None
+        st.write("**Prediction:**", LABELS[int(pred)])
+        if proba is not None:
+            st.write("Probability (Normal, Fraud):", proba)
+
+# Default fallback
+else:
+    st.write("Choose an option from the sidebar.")
+
+# Footer
+st.markdown("---")
+st.caption("App created to demonstrate full pipeline for credit card fraud detection. Modify parameters in the sidebar as needed.")
